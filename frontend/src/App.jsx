@@ -35,6 +35,8 @@ function App() {
   const [sessionSeconds, setSessionSeconds] = useState(0);
   const [cameraReady, setCameraReady] = useState(false);
   const [isSessionRunning, setIsSessionRunning] = useState(false);
+  const [cameraFacing, setCameraFacing] = useState('user');
+  const [isSwitchingCamera, setIsSwitchingCamera] = useState(false);
 
   const activeSport = player.sport || sport;
   const activeActivity = player.preferred_activity || activity;
@@ -48,6 +50,19 @@ function App() {
 
   useEffect(() => {
     loadPlayers();
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (animationRef.current) cancelAnimationFrame(animationRef.current);
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+      }
+      if (videoRef.current) {
+        videoRef.current.srcObject = null;
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -159,32 +174,72 @@ function App() {
     setCameraActive(false);
     setCameraReady(false);
     setCameraStatus('Camera stopped');
+    setCameraFacing('user');
     setIsSessionRunning(false);
   };
 
-  const startCamera = async () => {
+  const attachVideoStream = async (stream, facingMode) => {
+    streamRef.current = stream;
+    if (videoRef.current) {
+      videoRef.current.srcObject = stream;
+      videoRef.current.style.transform = facingMode === 'user' ? 'scaleX(-1)' : 'scaleX(1)';
+      try {
+        await videoRef.current.play();
+      } catch (error) {
+        console.warn('Video playback could not start immediately:', error);
+      }
+    }
+    setCameraFacing(facingMode);
+    setCameraActive(true);
+    setCameraReady(true);
+    setCameraStatus(facingMode === 'user' ? 'Front Camera' : 'Back Camera');
+  };
+
+  const requestCameraStream = async (facingMode) => {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setCameraError('Camera API is not supported in this browser.');
-      return;
+      return null;
     }
+
+    const constraints = {
+      video: {
+        facingMode: facingMode === 'user' ? 'user' : { exact: 'environment' },
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+      },
+      audio: false,
+    };
 
     try {
       setCameraError('');
-      setCameraStatus('Requesting camera access...');
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
-        audio: false,
-      });
+      setCameraStatus(facingMode === 'user' ? 'Requesting front camera...' : 'Requesting back camera...');
+      return await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (error) {
+      console.error(error);
+      const isPermissionDenied = ['NotAllowedError', 'PermissionDeniedError'].includes(error?.name) || /permission|denied/i.test(error?.message || '');
+      const isBackCameraUnavailable = ['NotFoundError', 'OverconstrainedError'].includes(error?.name) || /environment|facingMode/i.test(error?.message || '');
 
-      streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
+      if (isPermissionDenied) {
+        setCameraError('Camera permission is required to use Live Camera.');
+        setCameraStatus('Camera access failed');
+      } else if (facingMode === 'environment' && isBackCameraUnavailable) {
+        setCameraError('Back camera is not available on this device.');
+        setCameraStatus('Back camera unavailable');
+      } else {
+        setCameraError('Camera permission is required to use Live Camera.');
+        setCameraStatus('Camera access failed');
       }
-      setCameraActive(true);
-      setCameraReady(true);
-      setCameraStatus('Camera connected');
+      return null;
+    }
+  };
 
+  const startCamera = async () => {
+    const stream = await requestCameraStream('user');
+    if (!stream) return;
+
+    await attachVideoStream(stream, 'user');
+
+    if (!landmarkerRef.current) {
       const { FilesetResolver, PoseLandmarker } = await import('@mediapipe/tasks-vision');
       const vision = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm');
       landmarkerRef.current = await PoseLandmarker.createFromOptions(vision, {
@@ -195,60 +250,80 @@ function App() {
         runningMode: 'VIDEO',
         numPoses: 1,
       });
-
-      setCameraStatus('Live pose detection ready');
-      const drawLoop = () => {
-        if (!videoRef.current) return;
-        if (videoRef.current.readyState >= 2 && landmarkerRef.current) {
-          const now = performance.now();
-          const result = landmarkerRef.current.detectForVideo(videoRef.current, now);
-          const canvas = canvasRef.current;
-          const ctx = canvas?.getContext('2d');
-          if (canvas && ctx) {
-            canvas.width = videoRef.current.videoWidth || 640;
-            canvas.height = videoRef.current.videoHeight || 480;
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-            if (result.landmarks && result.landmarks.length) {
-              const pose = result.landmarks[0];
-              const connections = [
-                [0, 1], [1, 2], [2, 3], [3, 7], [0, 4], [4, 5], [5, 6], [6, 8], [9, 10], [11, 12], [11, 13], [13, 15], [15, 17], [17, 19], [19, 21], [12, 14], [14, 16], [16, 18], [18, 20], [20, 22], [11, 23], [12, 24], [23, 24], [23, 25], [24, 26], [25, 27], [26, 28], [27, 29], [28, 30], [29, 31], [30, 32], [27, 28]
-              ];
-
-              ctx.strokeStyle = '#49d39a';
-              ctx.lineWidth = 3;
-              connections.forEach(([start, end]) => {
-                const startPoint = pose[start];
-                const endPoint = pose[end];
-                if (startPoint && endPoint) {
-                  ctx.beginPath();
-                  ctx.moveTo(startPoint.x * canvas.width, startPoint.y * canvas.height);
-                  ctx.lineTo(endPoint.x * canvas.width, endPoint.y * canvas.height);
-                  ctx.stroke();
-                }
-              });
-
-              ctx.fillStyle = '#6be0ff';
-              pose.forEach((point) => {
-                if (point && point.visibility > 0.2) {
-                  ctx.beginPath();
-                  ctx.arc(point.x * canvas.width, point.y * canvas.height, 4, 0, Math.PI * 2);
-                  ctx.fill();
-                }
-              });
-            }
-          }
-
-          updateLiveFromPose(result.landmarks);
-        }
-        animationRef.current = requestAnimationFrame(drawLoop);
-      };
-      animationRef.current = requestAnimationFrame(drawLoop);
-    } catch (error) {
-      console.error(error);
-      setCameraError('Camera permission is required for Live AI Analysis.');
-      setCameraStatus('Camera access failed');
     }
+
+    setCameraStatus('Live pose detection ready');
+    const drawLoop = () => {
+      if (!videoRef.current) return;
+      if (videoRef.current.readyState >= 2 && landmarkerRef.current) {
+        const now = performance.now();
+        const result = landmarkerRef.current.detectForVideo(videoRef.current, now);
+        const canvas = canvasRef.current;
+        const ctx = canvas?.getContext('2d');
+        if (canvas && ctx) {
+          canvas.width = videoRef.current.videoWidth || 640;
+          canvas.height = videoRef.current.videoHeight || 480;
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+          if (result.landmarks && result.landmarks.length) {
+            const pose = result.landmarks[0];
+            const connections = [
+              [0, 1], [1, 2], [2, 3], [3, 7], [0, 4], [4, 5], [5, 6], [6, 8], [9, 10], [11, 12], [11, 13], [13, 15], [15, 17], [17, 19], [19, 21], [12, 14], [14, 16], [16, 18], [18, 20], [20, 22], [11, 23], [12, 24], [23, 24], [23, 25], [24, 26], [25, 27], [26, 28], [27, 29], [28, 30], [29, 31], [30, 32], [27, 28]
+            ];
+
+            ctx.strokeStyle = '#49d39a';
+            ctx.lineWidth = 3;
+            connections.forEach(([start, end]) => {
+              const startPoint = pose[start];
+              const endPoint = pose[end];
+              if (startPoint && endPoint) {
+                ctx.beginPath();
+                ctx.moveTo(startPoint.x * canvas.width, startPoint.y * canvas.height);
+                ctx.lineTo(endPoint.x * canvas.width, endPoint.y * canvas.height);
+                ctx.stroke();
+              }
+            });
+
+            ctx.fillStyle = '#6be0ff';
+            pose.forEach((point) => {
+              if (point && point.visibility > 0.2) {
+                ctx.beginPath();
+                ctx.arc(point.x * canvas.width, point.y * canvas.height, 4, 0, Math.PI * 2);
+                ctx.fill();
+              }
+            });
+          }
+        }
+
+        updateLiveFromPose(result.landmarks);
+      }
+      animationRef.current = requestAnimationFrame(drawLoop);
+    };
+    animationRef.current = requestAnimationFrame(drawLoop);
+  };
+
+  const switchCamera = async () => {
+    if (!cameraActive || isSwitchingCamera) return;
+
+    const nextFacing = cameraFacing === 'user' ? 'environment' : 'user';
+    setIsSwitchingCamera(true);
+    setCameraError('');
+    setCameraStatus(nextFacing === 'user' ? 'Switching to Front Camera...' : 'Switching to Back Camera...');
+
+    const oldStream = streamRef.current;
+    if (oldStream) {
+      oldStream.getTracks().forEach((track) => track.stop());
+    }
+
+    const stream = await requestCameraStream(nextFacing);
+    if (!stream) {
+      setIsSwitchingCamera(false);
+      return;
+    }
+
+    await attachVideoStream(stream, nextFacing);
+    setIsSwitchingCamera(false);
+    setCameraStatus(`${nextFacing === 'user' ? 'Front Camera' : 'Back Camera'}`);
   };
 
   const saveLiveSession = async (payload) => {
@@ -285,9 +360,15 @@ function App() {
       setPlayers((prev) => [...prev, selected]);
     }
     setIsSessionRunning(true);
-    sessionStartRef.current = Date.now();
-    setCameraStatus('Live session running');
+    sessionStartRef.current = Date.now() - (sessionSeconds * 1000);
+    setCameraStatus(`${cameraFacing === 'user' ? 'Front Camera' : 'Back Camera'} active`);
     setStatus('Live AI analysis in progress.');
+  };
+
+  const pauseLiveSession = () => {
+    setIsSessionRunning(false);
+    setStatus('Live AI analysis paused.');
+    setCameraStatus(`${cameraFacing === 'user' ? 'Front Camera' : 'Back Camera'} paused`);
   };
 
   const endLiveSession = async () => {
@@ -629,7 +710,8 @@ function App() {
                 </div>
 
                 <div className="live-status-block">
-                  <span className="badge live-badge">{cameraStatus}</span>
+                  <span className="badge live-badge">{cameraFacing === 'user' ? 'Front Camera' : 'Back Camera'}</span>
+                  <span className="status-subtext">{cameraStatus}</span>
                   <span className="status-subtext">{isSessionRunning ? `Session ${sessionSeconds}s` : cameraReady ? 'Camera ready' : 'Waiting for camera activation'}</span>
                 </div>
 
@@ -640,16 +722,22 @@ function App() {
                 </div>
 
                 {cameraError && <div className="live-error">{cameraError}</div>}
-                <div className="card-row">
+                <div className="card-row camera-actions">
                   <button
                     className="btn primary"
                     onClick={cameraActive ? startLiveSession : startCamera}
                     disabled={loading}
                   >
-                    {cameraActive ? (isSessionRunning ? 'Session running' : 'Start live session') : 'Enable camera'}
+                    {cameraActive ? 'Start' : 'Start'}
+                  </button>
+                  <button className="btn secondary" onClick={pauseLiveSession} disabled={!cameraActive || !isSessionRunning}>
+                    Pause
                   </button>
                   <button className="btn secondary" onClick={isSessionRunning ? endLiveSession : stopCameraStream}>
-                    {isSessionRunning ? 'End session' : 'Stop camera'}
+                    {isSessionRunning ? 'Stop' : 'Stop'}
+                  </button>
+                  <button className="btn switch-btn" onClick={switchCamera} disabled={!cameraActive || isSwitchingCamera}>
+                    {isSwitchingCamera ? 'Switching Camera...' : '🔄 Switch Camera'}
                   </button>
                 </div>
 

@@ -148,11 +148,17 @@ button, input, select { font: inherit; }
 }
 
 .btn:hover { transform: translateY(-1px); }
+.btn:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
 .btn.primary {
   background: linear-gradient(135deg, #6be0ff, #49d39a);
   color: #062214;
 }
 .btn.secondary { background: rgba(73, 211, 154, 0.12); color: var(--text); border: 1px solid rgba(124, 224, 175, 0.2); }
+.btn.switch-btn {
+  background: linear-gradient(135deg, rgba(107, 224, 255, 0.18), rgba(73, 211, 154, 0.18));
+  color: var(--text);
+  border: 1px solid rgba(107, 224, 255, 0.28);
+}
 
 .analysis-status {
   display: flex;
@@ -210,6 +216,18 @@ button, input, select { font: inherit; }
   justify-content: space-between;
   align-items: center;
   gap: 12px;
+}
+
+.camera-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  align-items: stretch;
+}
+
+.camera-actions .btn {
+  flex: 1 1 120px;
+  min-width: 120px;
 }
 
 .badge {
@@ -365,4 +383,6 @@ button, input, select { font: inherit; }
 @media (max-width: 900px) {
   .hero, .grid-2, .grid-3, .chart-grid, .grid-4 { grid-template-columns: 1fr; }
   .topbar { flex-direction: column; gap: 14px; }
+  .camera-actions { flex-direction: column; }
+  .camera-actions .btn { width: 100%; }
 }
