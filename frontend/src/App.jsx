@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts';
+import { useEffect, useRef, useState } from 'react';
+import { getValidActivity, SPORT_ACTIVITIES } from './constants/sportActivities';
+import { SPORT_ROLES, SUPPORTED_SPORTS } from './constants/sportRoles';
 
-const API_BASE = 'http://localhost:8000/api';
+const API_BASE = 'https://ai-sportsvision-backend-2026.onrender.com/api';
 const defaultPlayer = {
   name: 'Aarav Singh',
   age: 21,
@@ -13,17 +14,18 @@ const defaultPlayer = {
   training_goals: 'Improve head stability and balance during the swing phase.',
   previous_performance: 74,
 };
-const workflowSteps = ['Profile', 'Sport', 'Upload', 'Video prep', 'AI analysis', 'Metrics', 'Coaching', 'History'];
 
 function App() {
   const [player, setPlayer] = useState(defaultPlayer);
   const [sport, setSport] = useState('Cricket');
   const [activity, setActivity] = useState('Batting');
+  const [selectedPlayerId, setSelectedPlayerId] = useState('');
   const [file, setFile] = useState(null);
   const [players, setPlayers] = useState([]);
   const [sessions, setSessions] = useState([]);
   const [analysis, setAnalysis] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [savingProfile, setSavingProfile] = useState(false);
   const [status, setStatus] = useState('Ready for video upload');
   const [analysisMode, setAnalysisMode] = useState('upload');
   const [cameraActive, setCameraActive] = useState(false);
@@ -39,7 +41,8 @@ function App() {
   const [isSwitchingCamera, setIsSwitchingCamera] = useState(false);
 
   const activeSport = player.sport || sport;
-  const activeActivity = player.preferred_activity || activity;
+  const activeActivity = getValidActivity(activeSport, player.preferred_activity)
+    || getValidActivity(activeSport, activity);
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const streamRef = useRef(null);
@@ -72,18 +75,6 @@ function App() {
     }, 1000);
     return () => clearInterval(interval);
   }, [isSessionRunning]);
-
-  const performanceChartData = useMemo(() => {
-    if (!sessions.length) {
-      return [
-        { name: 'Session 1', score: 68 },
-        { name: 'Session 2', score: 72 },
-        { name: 'Session 3', score: 75 },
-        { name: 'Session 4', score: 79 },
-      ];
-    }
-    return sessions.map((session, index) => ({ name: `S${index + 1}`, score: session.overall_score }));
-  }, [sessions]);
 
   const clamp = (value, min = 0, max = 100) => Math.min(Math.max(value, min), max);
 
@@ -354,11 +345,8 @@ function App() {
   };
 
   const startLiveSession = async () => {
-    let selected = players[0];
-    if (!selected) {
-      selected = await createPlayer();
-      setPlayers((prev) => [...prev, selected]);
-    }
+    const selected = await saveProfile();
+    if (!selected) return;
     setIsSessionRunning(true);
     sessionStartRef.current = Date.now() - (sessionSeconds * 1000);
     setCameraStatus(`${cameraFacing === 'user' ? 'Front Camera' : 'Back Camera'} active`);
@@ -373,7 +361,8 @@ function App() {
 
   const endLiveSession = async () => {
     const durationSeconds = Math.max(1, Math.round((Date.now() - (sessionStartRef.current || Date.now())) / 1000));
-    const selectedPlayer = players[0] || (await createPlayer());
+    const selectedPlayer = players.find((item) => item.id === selectedPlayerId) || (await saveProfile());
+    if (!selectedPlayer) return;
     const finalMetrics = {
       ...liveMetrics,
       overall: liveMetrics.overall || 75,
@@ -449,44 +438,119 @@ function App() {
       if (response.ok) {
         const data = await response.json();
         setPlayers(data);
+        if (data.length) {
+          const activePlayerId = localStorage.getItem('sportsvision.activePlayerId');
+          const saved = data.find((item) => item.id === activePlayerId) || data[0];
+          const savedRoles = SPORT_ROLES[saved.sport] || [];
+          const savedRole = savedRoles.find((role) => role.toLowerCase() === saved.role?.toLowerCase()) || '';
+          const savedActivity = getValidActivity(saved.sport, saved.preferred_activity);
+          setSelectedPlayerId(saved.id);
+          localStorage.setItem('sportsvision.activePlayerId', saved.id);
+          setPlayer({ ...defaultPlayer, ...saved, role: savedRole, preferred_activity: savedActivity });
+          setSport(saved.sport);
+          setActivity(savedActivity);
+        } else {
+          localStorage.removeItem('sportsvision.activePlayerId');
+        }
       }
     } catch (error) {
       console.error(error);
     }
   };
 
-  const createPlayer = async () => {
+  const validateProfile = () => {
+    if (!SPORT_ROLES[player.sport]) {
+      setStatus('Please select a sport.');
+      return false;
+    }
+    if (!player.role) {
+      setStatus('Please select a role.');
+      return false;
+    }
+    if (!SPORT_ROLES[player.sport].includes(player.role)) {
+      setStatus('Please select a valid role for the selected sport.');
+      return false;
+    }
+    if (!getValidActivity(player.sport, player.preferred_activity)) {
+      setStatus('Please select a preferred activity for the selected sport.');
+      return false;
+    }
+    return true;
+  };
+
+  const saveProfile = async () => {
+    if (!validateProfile()) return null;
+    setSavingProfile(true);
+
     const payload = {
       ...player,
       sport: activeSport,
       preferred_activity: activeActivity,
     };
 
-    const response = await fetch(`${API_BASE}/players`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const created = await response.json();
-    setPlayers((prev) => [...prev, created]);
-    return created;
+    try {
+      const response = await fetch(selectedPlayerId ? `${API_BASE}/players/${selectedPlayerId}` : `${API_BASE}/players`, {
+        method: selectedPlayerId ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const saved = await response.json();
+      if (!response.ok) throw new Error(saved.detail || 'Failed to save profile.');
+
+      setSelectedPlayerId(saved.id);
+      localStorage.setItem('sportsvision.activePlayerId', saved.id);
+      setPlayers((prev) => selectedPlayerId
+        ? prev.map((item) => item.id === saved.id ? saved : item)
+        : [...prev, saved]);
+      setStatus('Profile saved.');
+      return saved;
+    } catch (error) {
+      setStatus(error.message || 'Failed to save profile.');
+      return null;
+    } finally {
+      setSavingProfile(false);
+    }
+  };
+
+  const selectProfile = (playerId) => {
+    setSelectedPlayerId(playerId);
+    if (playerId) localStorage.setItem('sportsvision.activePlayerId', playerId);
+    else localStorage.removeItem('sportsvision.activePlayerId');
+    const saved = players.find((item) => item.id === playerId);
+    if (!saved) {
+      setPlayer(defaultPlayer);
+      setSport(defaultPlayer.sport);
+      setActivity(defaultPlayer.preferred_activity);
+      return;
+    }
+
+    const savedRoles = SPORT_ROLES[saved.sport] || [];
+    const savedRole = savedRoles.find((role) => role.toLowerCase() === saved.role?.toLowerCase()) || '';
+    const savedActivity = getValidActivity(saved.sport, saved.preferred_activity);
+    setPlayer({ ...defaultPlayer, ...saved, role: savedRole, preferred_activity: savedActivity });
+    setSport(saved.sport);
+    setActivity(savedActivity);
   };
 
   const handleUploadAndAnalyze = async () => {
+    if (!validateProfile()) return;
     if (!file) {
       setStatus('Please select a valid MP4, MOV, or AVI file.');
       return;
     }
 
+    const selectedPlayer = await saveProfile();
+    if (!selectedPlayer) return;
+
     setLoading(true);
     setStatus('Uploading and validating video...');
 
     try {
-      const selectedPlayer = players[0] ?? (await createPlayer());
       const formData = new FormData();
       formData.append('file', file);
-      const requestSport = activeSport;
-      const requestActivity = activeActivity;
+      const requestSport = selectedPlayer.sport;
+      const requestRole = selectedPlayer.role;
+      const requestActivity = selectedPlayer.preferred_activity || activeActivity;
 
       const uploadResponse = await fetch(`${API_BASE}/upload`, {
         method: 'POST',
@@ -507,6 +571,7 @@ function App() {
         body: JSON.stringify({
           player_id: selectedPlayer.id,
           sport: requestSport,
+          role: requestRole,
           activity: requestActivity,
           video_path: uploadData.path,
         }),
@@ -533,7 +598,6 @@ function App() {
     }
   };
 
-  const componentScores = analysis?.analysis?.component_scores || { technique: 74, balance: 70, movement: 76, consistency: 72, stability: 69 };
   const weaknesses = analysis?.weaknesses || [
     {
       feature: 'Low head stability',
@@ -549,6 +613,7 @@ function App() {
       reason: 'Generated from detected setback in movement consistency and balance.',
     },
   ];
+  const statusTone = /failed|please select|invalid|unavailable|unable/i.test(status) ? 'is-error' : /saved|complete/i.test(status) ? 'is-success' : '';
 
   return (
     <div className="app-shell">
@@ -566,45 +631,16 @@ function App() {
           <div className="panel">
             <div className="card-row" style={{ marginBottom: '16px' }}>
               <h2 style={{ margin: 0 }}>Performance overview</h2>
-              <span className="badge">Cricket batting</span>
+              <span className="badge">{activeSport} · {player.role || 'Role not selected'} · {activeActivity || 'Activity not selected'}</span>
             </div>
 
-            <div className="grid-2">
-              <div className="metric-card">
-                <div className="metric-label">Overall score</div>
-                <div className="metric-value">{analysis?.analysis?.overall_score ?? 75.4}</div>
-              </div>
-              <div className="metric-card">
-                <div className="metric-label">Technique</div>
-                <div className="metric-value">{componentScores.technique}</div>
-              </div>
-              <div className="metric-card">
-                <div className="metric-label">Balance</div>
-                <div className="metric-value">{componentScores.balance}</div>
-              </div>
-              <div className="metric-card">
-                <div className="metric-label">Movement</div>
-                <div className="metric-value">{componentScores.movement}</div>
-              </div>
+            <div className="metric-card overall-score-card">
+              <div className="metric-label">Overall score</div>
+              <div className="metric-value">{analysis?.analysis?.overall_score ?? 75.4}</div>
             </div>
 
-            <div className="workflow-panel" style={{ marginTop: '18px' }}>
-              <div className="card-row" style={{ marginBottom: '8px' }}>
-                <h3 style={{ margin: 0 }}>Athlete workflow</h3>
-                <span className="badge">AI SportsVision</span>
-              </div>
-              <div className="grid-4">
-                {workflowSteps.map((step, index) => (
-                  <div key={step} className="workflow-step">
-                    <span className="workflow-index">{index + 1}</span>
-                    <span>{step}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            <div className="analysis-status">
-              <span>●</span>
+            <div className={`analysis-status ${statusTone}`} role="status" aria-live="polite">
+              <span className="status-marker" aria-hidden="true">●</span>
               <span>{status}</span>
             </div>
             <div className="progress-bar">
@@ -614,18 +650,26 @@ function App() {
 
           <div className="panel">
             <h3 style={{ marginTop: 0 }}>Athlete profile</h3>
+            <p className="panel-intro">Set the active athlete and choose the focus for this analysis.</p>
             <div className="form-group">
-              <label>Player name</label>
-              <input value={player.name} onChange={(e) => setPlayer({ ...player, name: e.target.value })} />
+              <label htmlFor="saved-profile">Saved profile</label>
+              <select id="saved-profile" value={selectedPlayerId} onChange={(e) => selectProfile(e.target.value)}>
+                <option value="">New profile</option>
+                {players.map((saved) => <option key={saved.id} value={saved.id}>{saved.name} ({saved.sport})</option>)}
+              </select>
+            </div>
+            <div className="form-group">
+              <label htmlFor="player-name">Player name</label>
+              <input id="player-name" value={player.name} onChange={(e) => setPlayer({ ...player, name: e.target.value })} />
             </div>
             <div className="grid-2">
               <div className="form-group">
-                <label>Age</label>
-                <input type="number" value={player.age} onChange={(e) => setPlayer({ ...player, age: Number(e.target.value) })} />
+                <label htmlFor="player-age">Age</label>
+                <input id="player-age" type="number" value={player.age} onChange={(e) => setPlayer({ ...player, age: Number(e.target.value) })} />
               </div>
               <div className="form-group">
-                <label>Gender</label>
-                <select value={player.gender} onChange={(e) => setPlayer({ ...player, gender: e.target.value })}>
+                <label htmlFor="player-gender">Gender</label>
+                <select id="player-gender" value={player.gender} onChange={(e) => setPlayer({ ...player, gender: e.target.value })}>
                   <option>Male</option>
                   <option>Female</option>
                   <option>Prefer not to say</option>
@@ -634,53 +678,55 @@ function App() {
             </div>
             <div className="grid-2">
               <div className="form-group">
-                <label>Role</label>
-                <select value={player.role} onChange={(e) => setPlayer({ ...player, role: e.target.value })}>
-                  <option>Batter</option>
-                  <option>Bowler</option>
-                  <option>All-rounder</option>
-                  <option>Wicketkeeper</option>
+                <label htmlFor="player-sport">Sport</label>
+                <select id="player-sport" value={activeSport} onChange={(e) => {
+                  const nextSport = e.target.value;
+                  const nextActivity = getValidActivity(nextSport, player.preferred_activity);
+                  setSport(nextSport);
+                  setActivity(nextActivity);
+                  setPlayer((prev) => ({
+                    ...prev,
+                    sport: nextSport,
+                    role: SPORT_ROLES[nextSport]?.includes(prev.role) ? prev.role : '',
+                    preferred_activity: nextActivity,
+                  }));
+                }}>
+                  <option value="">Select Sport</option>
+                  {SUPPORTED_SPORTS.map((item) => <option key={item}>{item}</option>)}
                 </select>
               </div>
               <div className="form-group">
-                <label>Experience</label>
-                <select value={player.experience_level} onChange={(e) => setPlayer({ ...player, experience_level: e.target.value })}>
-                  <option>Beginner</option>
-                  <option>Intermediate</option>
-                  <option>Advanced</option>
+                <label htmlFor="player-role">Role</label>
+                <select id="player-role" value={player.role} onChange={(e) => setPlayer((prev) => ({ ...prev, role: e.target.value }))}>
+                  <option value="">Select Role</option>
+                  {(SPORT_ROLES[activeSport] || []).map((role) => <option key={role}>{role}</option>)}
                 </select>
               </div>
             </div>
             <div className="grid-2">
               <div className="form-group">
-                <label>Sport</label>
-                <select value={activeSport} onChange={(e) => {
-                  const nextSport = e.target.value;
-                  setSport(nextSport);
-                  setPlayer((prev) => ({ ...prev, sport: nextSport }));
-                }}>
-                  <option>Cricket</option>
-                  <option>Football</option>
-                  <option>Basketball</option>
-                  <option>Badminton</option>
+                <label htmlFor="player-experience">Experience</label>
+                <select id="player-experience" value={player.experience_level} onChange={(e) => setPlayer({ ...player, experience_level: e.target.value })}>
+                  <option>Beginner</option>
+                  <option>Intermediate</option>
+                  <option>Advanced</option>
                 </select>
               </div>
               <div className="form-group">
-                <label>Preferred activity</label>
-                <select value={activeActivity} onChange={(e) => {
+                <label htmlFor="player-activity">Preferred activity</label>
+                <select id="player-activity" value={activeActivity} onChange={(e) => {
                   const nextActivity = e.target.value;
                   setActivity(nextActivity);
                   setPlayer((prev) => ({ ...prev, preferred_activity: nextActivity }));
                 }}>
-                  <option>Batting</option>
-                  <option>Bowling</option>
-                  <option>Fielding</option>
+                  <option value="">Select Activity</option>
+                  {(SPORT_ACTIVITIES[activeSport] || []).map((item) => <option key={item}>{item}</option>)}
                 </select>
               </div>
             </div>
             <div className="form-group">
-              <label>Training goals</label>
-              <textarea rows="3" value={player.training_goals} onChange={(e) => setPlayer({ ...player, training_goals: e.target.value })} />
+              <label htmlFor="training-goals">Training goals</label>
+              <textarea id="training-goals" rows="3" value={player.training_goals} onChange={(e) => setPlayer({ ...player, training_goals: e.target.value })} />
             </div>
             <div className="form-group">
               <label>Analysis mode</label>
@@ -737,6 +783,7 @@ function App() {
                     {isSessionRunning ? 'Stop' : 'Stop'}
                   </button>
                   <button className="btn switch-btn" onClick={switchCamera} disabled={!cameraActive || isSwitchingCamera}>
+                    {isSwitchingCamera && <span className="loading-spinner" aria-hidden="true" />}
                     {isSwitchingCamera ? 'Switching Camera...' : '🔄 Switch Camera'}
                   </button>
                 </div>
@@ -747,7 +794,7 @@ function App() {
                     {liveWeaknesses.map((item, idx) => (
                       <div className="list-item" key={`${item.feature}-${idx}`}>
                         <div style={{ fontWeight: 700 }}>{item.feature}</div>
-                        <div style={{ color: '#d8ecff', marginTop: '4px' }}>{item.suggested_improvement}</div>
+                        <div className="detail-copy" style={{ marginTop: '4px' }}>{item.suggested_improvement}</div>
                       </div>
                     ))}
                   </div>
@@ -756,49 +803,22 @@ function App() {
             ) : (
               <>
                 <div className="form-group">
-                  <label>Video upload</label>
-                  <input type="file" accept=".mp4,.mov,.avi,.webm" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
+                  <label htmlFor="video-upload">Video upload</label>
+                  <input id="video-upload" type="file" accept=".mp4,.mov,.avi,.webm" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
+                  <span className="field-help">MP4, MOV, AVI, and WebM files are supported.</span>
                 </div>
-                <div className="card-row">
-                  <button className="btn primary" onClick={handleUploadAndAnalyze} disabled={loading}>{loading ? 'Analyzing...' : 'Start AI analysis'}</button>
-                  <button className="btn secondary" onClick={createPlayer}>Save profile</button>
+                <div className="card-row action-row">
+                  <button className="btn primary" onClick={handleUploadAndAnalyze} disabled={loading}>
+                    {loading && <span className="loading-spinner" aria-hidden="true" />}
+                    {loading ? 'Analyzing...' : 'Start AI analysis'}
+                  </button>
+                  <button className="btn secondary" onClick={saveProfile} aria-busy={savingProfile}>
+                    {savingProfile && <span className="loading-spinner" aria-hidden="true" />}
+                    Save profile
+                  </button>
                 </div>
               </>
             )}
-          </div>
-        </section>
-
-        <section className="chart-grid">
-          <div className="panel">
-            <h3 style={{ marginTop: 0 }}>Performance trend</h3>
-            <ResponsiveContainer width="100%" height={220}>
-              <AreaChart data={performanceChartData}>
-                <defs>
-                  <linearGradient id="scoreGradient" x1="0" x2="0" y1="0" y2="1">
-                    <stop offset="5%" stopColor="#42b7ff" stopOpacity={0.8} />
-                    <stop offset="95%" stopColor="#42b7ff" stopOpacity={0.1} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="rgba(160,177,204,0.15)" />
-                <XAxis dataKey="name" stroke="#bfd2ed" />
-                <YAxis stroke="#bfd2ed" domain={[0, 100]} />
-                <Tooltip />
-                <Area type="monotone" dataKey="score" stroke="#42b7ff" fill="url(#scoreGradient)" />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
-
-          <div className="panel">
-            <h3 style={{ marginTop: 0 }}>Component scores</h3>
-            <ResponsiveContainer width="100%" height={220}>
-              <BarChart data={Object.entries(componentScores).map(([name, value]) => ({ name, value }))}>
-                <CartesianGrid strokeDasharray="3 3" stroke="rgba(160,177,204,0.15)" />
-                <XAxis dataKey="name" stroke="#bfd2ed" />
-                <YAxis stroke="#bfd2ed" domain={[0, 100]} />
-                <Tooltip />
-                <Bar dataKey="value" fill="#7dd3fc" radius={[6, 6, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
           </div>
         </section>
 
@@ -810,9 +830,9 @@ function App() {
                 <div className="list-item" key={`${weakness.feature}-${index}`}>
                   <div className={`severity ${weakness.severity?.toLowerCase() || 'medium'}`}>{weakness.severity || 'Medium'}</div>
                   <div style={{ fontWeight: 700, marginBottom: '6px' }}>{weakness.feature}</div>
-                  <div style={{ color: '#c9d7ec', marginBottom: '6px' }}>{weakness.issue}</div>
-                  <div style={{ fontSize: '0.8rem', color: '#9ab4d4' }}>{weakness.evidence}</div>
-                  <div style={{ marginTop: '8px', color: '#d8ecff' }}>{weakness.suggested_improvement}</div>
+                  <div className="detail-copy" style={{ marginBottom: '6px' }}>{weakness.issue}</div>
+                  <div className="muted-copy" style={{ fontSize: '0.8rem' }}>{weakness.evidence}</div>
+                  <div className="detail-copy" style={{ marginTop: '8px' }}>{weakness.suggested_improvement}</div>
                 </div>
               ))}
             </div>
@@ -824,8 +844,8 @@ function App() {
               {recommendations.map((item, index) => (
                 <div className="list-item" key={`${item.title}-${index}`}>
                   <div style={{ fontWeight: 700, marginBottom: '6px' }}>{item.title}</div>
-                  <div style={{ color: '#d8ecff', marginBottom: '6px' }}>{item.description}</div>
-                  <div style={{ fontSize: '0.8rem', color: '#9ab4d4' }}>{item.reason}</div>
+                  <div className="detail-copy" style={{ marginBottom: '6px' }}>{item.description}</div>
+                  <div className="muted-copy" style={{ fontSize: '0.8rem' }}>{item.reason}</div>
                 </div>
               ))}
             </div>
@@ -839,8 +859,8 @@ function App() {
               {(analysis?.repeated_mistakes || [{ feature: 'Head stability', sessions_affected: 4, trend: 'Repeated pattern detected' }]).map((mistake, idx) => (
                 <div className="list-item" key={`${mistake.feature}-${idx}`}>
                   <div style={{ fontWeight: 700 }}>{mistake.feature}</div>
-                  <div style={{ color: '#d8ecff', marginTop: '6px' }}>Affected sessions: {mistake.sessions_affected || 4}</div>
-                  <div style={{ color: '#9ab4d4', marginTop: '6px' }}>{mistake.trend}</div>
+                  <div className="detail-copy" style={{ marginTop: '6px' }}>Affected sessions: {mistake.sessions_affected || 4}</div>
+                  <div className="muted-copy" style={{ marginTop: '6px' }}>{mistake.trend}</div>
                 </div>
               ))}
             </div>
@@ -850,11 +870,11 @@ function App() {
             <h3 style={{ marginTop: 0 }}>Prediction</h3>
             <div className="list-item">
               <div style={{ fontWeight: 700 }}>Current performance</div>
-              <div style={{ color: '#d8ecff', marginTop: '6px' }}>{analysis?.prediction?.current_performance ?? 75.4}</div>
+              <div className="detail-copy" style={{ marginTop: '6px' }}>{analysis?.prediction?.current_performance ?? 75.4}</div>
             </div>
             <div className="list-item" style={{ marginTop: '12px' }}>
               <div style={{ fontWeight: 700 }}>Predicted future performance</div>
-              <div style={{ color: '#d8ecff', marginTop: '6px' }}>{analysis?.prediction?.predicted_future_performance ?? 'Insufficient historical sessions for prediction.'}</div>
+              <div className="detail-copy" style={{ marginTop: '6px' }}>{analysis?.prediction?.predicted_future_performance ?? 'Insufficient historical sessions for prediction.'}</div>
             </div>
           </div>
         </section>
@@ -868,7 +888,7 @@ function App() {
                   <strong>{session.activity || 'Batting'}</strong>
                   <span className="badge">{session.overall_score ?? 76.2}</span>
                 </div>
-                <div style={{ color: '#9ab4d4', marginTop: '8px' }}>{session.sport || 'Cricket'}</div>
+                <div className="muted-copy" style={{ marginTop: '8px' }}>{session.sport || 'Cricket'}</div>
               </div>
             ))}
           </div>
