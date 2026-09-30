@@ -23,6 +23,7 @@ router = APIRouter(prefix="/api", tags=["analysis"])
 class AnalysisRequest(BaseModel):
     player_id: str = Field(...)
     sport: str = "Cricket"
+    role: str | None = None
     activity: str = "Batting"
     video_path: str = Field(...)
 
@@ -114,6 +115,7 @@ def analyze_video(payload: AnalysisRequest, db: Session = Depends(get_db)):
         "session_id": session_id,
         "player": player.name,
         "sport": payload.sport,
+        "role": payload.role or player.role,
         "activity": payload.activity,
         "processing_pipeline": [
             "Uploading",
