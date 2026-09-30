@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { getValidActivity, SPORT_ACTIVITIES } from './constants/sportActivities';
 import { SPORT_ROLES, SUPPORTED_SPORTS } from './constants/sportRoles';
 
-const API_BASE = 'https://ai-sportsvision-backend-2026.onrender.com/api';
+const API_BASE = import.meta.env.VITE_API_BASE_URL || 'https://ai-sportsvision-backend-2026.onrender.com/api';
 const defaultPlayer = {
   name: 'Aarav Singh',
   age: 21,
@@ -31,9 +31,8 @@ function App() {
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraStatus, setCameraStatus] = useState('Camera idle');
   const [cameraError, setCameraError] = useState('');
-  const [liveMetrics, setLiveMetrics] = useState({ technique: 0, balance: 0, movement: 0, consistency: 0, stability: 0, overall: 0 });
   const [liveInsight, setLiveInsight] = useState('Waiting for live pose detection.');
-  const [liveWeaknesses, setLiveWeaknesses] = useState([]);
+  const [poseFrameCount, setPoseFrameCount] = useState(0);
   const [sessionSeconds, setSessionSeconds] = useState(0);
   const [cameraReady, setCameraReady] = useState(false);
   const [isSessionRunning, setIsSessionRunning] = useState(false);
@@ -48,8 +47,10 @@ function App() {
   const streamRef = useRef(null);
   const landmarkerRef = useRef(null);
   const animationRef = useRef(null);
-  const historyRef = useRef([]);
   const sessionStartRef = useRef(null);
+  const poseSamplesRef = useRef([]);
+  const lastPoseSampleAtRef = useRef(0);
+  const captureSessionRef = useRef(false);
 
   useEffect(() => {
     loadPlayers();
@@ -76,84 +77,29 @@ function App() {
     return () => clearInterval(interval);
   }, [isSessionRunning]);
 
-  const clamp = (value, min = 0, max = 100) => Math.min(Math.max(value, min), max);
-
   const updateLiveFromPose = (landmarks) => {
-    if (!landmarks || !landmarks.length) {
-      setLiveInsight('No reliable pose detected. Improve lighting and keep the athlete fully in frame.');
-      setLiveMetrics((prev) => ({ ...prev, technique: 0, balance: 0, movement: 0, consistency: 0, stability: 0, overall: 0 }));
-      setLiveWeaknesses([]);
+    if (!captureSessionRef.current || Date.now() - lastPoseSampleAtRef.current < 500) return;
+    lastPoseSampleAtRef.current = Date.now();
+    const pose = landmarks?.[0];
+    const sample = pose?.length >= 33 ? pose.map((point) => ({
+      x: point.x,
+      y: point.y,
+      z: point.z || 0,
+      visibility: point.visibility || 0,
+    })) : null;
+    poseSamplesRef.current.push(sample);
+    if (poseSamplesRef.current.length > 180) poseSamplesRef.current.shift();
+    const validSampleCount = poseSamplesRef.current.filter(Boolean).length;
+    setPoseFrameCount(validSampleCount);
+    if (!sample) {
+      setLiveInsight('No pose in the latest sample. Keep the athlete fully in frame with clear lighting.');
       return;
     }
-
-    const pose = landmarks[0];
-    const getPoint = (index) => pose[index] || null;
-    const nose = getPoint(0);
-    const leftShoulder = getPoint(11);
-    const rightShoulder = getPoint(12);
-    const leftHip = getPoint(23);
-    const rightHip = getPoint(24);
-    const leftAnkle = getPoint(27);
-    const rightAnkle = getPoint(28);
-
-    let shoulderAlignment = 100;
-    let hipAlignment = 100;
-    let headStability = 100;
-
-    if (leftShoulder && rightShoulder) {
-      shoulderAlignment = clamp(100 - Math.abs(leftShoulder.x - rightShoulder.x) * 220);
-    }
-    if (leftHip && rightHip) {
-      hipAlignment = clamp(100 - Math.abs(leftHip.x - rightHip.x) * 220);
-    }
-    if (nose) {
-      historyRef.current.push({ x: nose.x, y: nose.y });
-      if (historyRef.current.length > 18) historyRef.current.shift();
-      const recent = historyRef.current;
-      const avgX = recent.reduce((sum, item) => sum + item.x, 0) / recent.length;
-      const avgY = recent.reduce((sum, item) => sum + item.y, 0) / recent.length;
-      const varianceX = recent.reduce((sum, item) => sum + Math.abs(item.x - avgX), 0) / recent.length;
-      const varianceY = recent.reduce((sum, item) => sum + Math.abs(item.y - avgY), 0) / recent.length;
-      headStability = clamp(100 - (varianceX * 180 + varianceY * 120));
-    }
-
-    const balanceScore = clamp((shoulderAlignment + hipAlignment + (leftAnkle && rightAnkle ? clamp(100 - Math.abs(leftAnkle.x - rightAnkle.x) * 200) : 100)) / 3);
-    const movementScore = clamp(60 + (Math.abs((leftShoulder?.x ?? 0) - (rightShoulder?.x ?? 0)) * 60) + (leftAnkle && rightAnkle ? clamp(100 - Math.abs(leftAnkle.x - rightAnkle.x) * 120) : 50));
-    const consistencyScore = clamp(50 + (100 - Math.abs(shoulderAlignment - hipAlignment)) / 2);
-    const stabilityScore = clamp((headStability + balanceScore + consistencyScore) / 3);
-    const techniqueScore = clamp((shoulderAlignment * 0.45) + (headStability * 0.3) + (hipAlignment * 0.25));
-    const overall = clamp((techniqueScore * 0.3) + (balanceScore * 0.25) + (movementScore * 0.2) + (consistencyScore * 0.15) + (stabilityScore * 0.1));
-
-    const nextMetrics = {
-      technique: Number(techniqueScore.toFixed(1)),
-      balance: Number(balanceScore.toFixed(1)),
-      movement: Number(movementScore.toFixed(1)),
-      consistency: Number(consistencyScore.toFixed(1)),
-      stability: Number(stabilityScore.toFixed(1)),
-      overall: Number(overall.toFixed(1)),
-    };
-
-    const weaknessList = [];
-    if (headStability < 72) {
-      weaknessList.push({ feature: 'Head stability', severity: 'Medium', evidence: 'Head position varies noticeably through the motion cycle.', suggested_improvement: 'Keep the head still and eyes level during the swing setup.' });
-    }
-    if (shoulderAlignment < 78) {
-      weaknessList.push({ feature: 'Shoulder alignment', severity: 'Medium', evidence: 'Shoulder positions are uneven during movement.', suggested_improvement: 'Keep shoulders level and aligned during the stance and preparation phase.' });
-    }
-    if (balanceScore < 74) {
-      weaknessList.push({ feature: 'Balance instability', severity: 'High', evidence: 'Body alignment shifts while the athlete is in motion.', suggested_improvement: 'Focus on stable lower-body posture and controlled foot placement.' });
-    }
-
-    setLiveMetrics(nextMetrics);
-    setLiveWeaknesses(weaknessList);
-    setLiveInsight(
-      weaknessList.length
-        ? `Main focus: ${weaknessList[0].feature}. Maintain a more stable body line during the movement phase.`
-        : 'Technique is stable. Continue tracking posture and lower-body alignment.'
-    );
+    setLiveInsight(`${validSampleCount} pose samples collected for post-session analysis.`);
   };
 
   const stopCameraStream = () => {
+    captureSessionRef.current = false;
     if (animationRef.current) cancelAnimationFrame(animationRef.current);
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
@@ -347,6 +293,10 @@ function App() {
   const startLiveSession = async () => {
     const selected = await saveProfile();
     if (!selected) return;
+    poseSamplesRef.current = [];
+    lastPoseSampleAtRef.current = 0;
+    setPoseFrameCount(0);
+    captureSessionRef.current = true;
     setIsSessionRunning(true);
     sessionStartRef.current = Date.now() - (sessionSeconds * 1000);
     setCameraStatus(`${cameraFacing === 'user' ? 'Front Camera' : 'Back Camera'} active`);
@@ -354,79 +304,33 @@ function App() {
   };
 
   const pauseLiveSession = () => {
+    captureSessionRef.current = false;
     setIsSessionRunning(false);
     setStatus('Live AI analysis paused.');
     setCameraStatus(`${cameraFacing === 'user' ? 'Front Camera' : 'Back Camera'} paused`);
   };
 
   const endLiveSession = async () => {
+    captureSessionRef.current = false;
     const durationSeconds = Math.max(1, Math.round((Date.now() - (sessionStartRef.current || Date.now())) / 1000));
     const selectedPlayer = players.find((item) => item.id === selectedPlayerId) || (await saveProfile());
     if (!selectedPlayer) return;
-    const finalMetrics = {
-      ...liveMetrics,
-      overall: liveMetrics.overall || 75,
-      durationSeconds,
-      source: 'LIVE CAMERA',
-      id: `live-${Date.now()}`,
-    };
-
-    const summary = {
-      id: finalMetrics.id,
-      date: new Date().toISOString(),
-      sport: activeSport,
-      activity: activeActivity,
-      overall_score: Number(finalMetrics.overall),
-      technique_score: Number(finalMetrics.technique),
-      balance_score: Number(finalMetrics.balance),
-      movement_score: Number(finalMetrics.movement),
-      consistency_score: Number(finalMetrics.consistency),
-      stability_score: Number(finalMetrics.stability),
-      weaknesses: liveWeaknesses,
-      recommendations: liveWeaknesses.length ? [{ title: 'Live coaching focus', description: liveInsight, reason: 'Based on live movement metrics and detected instability.' }] : [{ title: 'Technique stable', description: 'Continue the current movement pattern and monitor consistency.', reason: 'No major live weakness detected.' }],
-      source: 'LIVE CAMERA',
-      duration: durationSeconds,
-    };
-
     const liveSessionPayload = {
       player_id: selectedPlayer.id,
       sport: activeSport,
+      role: player.role,
       activity: activeActivity,
       duration_seconds: durationSeconds,
-      overall_score: Number(finalMetrics.overall),
-      technique_score: Number(finalMetrics.technique),
-      balance_score: Number(finalMetrics.balance),
-      movement_score: Number(finalMetrics.movement),
-      consistency_score: Number(finalMetrics.consistency),
-      stability_score: Number(finalMetrics.stability),
-      weaknesses: liveWeaknesses,
-      recommendations: summary.recommendations,
-      ai_insight: liveInsight,
+      pose_frames: poseSamplesRef.current.filter(Boolean),
+      sampled_frames: poseSamplesRef.current.length,
     };
-
-    setSessions((prev) => [summary, ...prev]);
-    setAnalysis({
-      session_id: summary.id,
-      player: player.name,
-      sport: activeSport,
-      activity: activeActivity,
-      analysis: {
-        overall_score: summary.overall_score,
-        component_scores: {
-          technique: summary.technique_score,
-          balance: summary.balance_score,
-          movement: summary.movement_score,
-          consistency: summary.consistency_score,
-          stability: summary.stability_score,
-        },
-      },
-      weaknesses: summary.weaknesses,
-      recommendations: summary.recommendations,
-      prediction: { current_performance: summary.overall_score, predicted_future_performance: 'More sessions are required for reliable prediction.' },
-      repeated_mistakes: liveWeaknesses.length ? [{ feature: liveWeaknesses[0].feature, sessions_affected: 1, trend: 'Detected in current live session' }] : [],
-    });
-
-    await saveLiveSession(liveSessionPayload);
+    const savedSession = await saveLiveSession(liveSessionPayload);
+    if (!savedSession) {
+      setIsSessionRunning(false);
+      stopCameraStream();
+      return;
+    }
+    setAnalysis(savedSession);
     setStatus('Live session saved to performance history.');
     setIsSessionRunning(false);
     stopCameraStream();
@@ -513,6 +417,7 @@ function App() {
   };
 
   const selectProfile = (playerId) => {
+    setAnalysis(null);
     setSelectedPlayerId(playerId);
     if (playerId) localStorage.setItem('sportsvision.activePlayerId', playerId);
     else localStorage.removeItem('sportsvision.activePlayerId');
@@ -598,22 +503,18 @@ function App() {
     }
   };
 
-  const weaknesses = analysis?.weaknesses || [
-    {
-      feature: 'Low head stability',
-      severity: 'Medium',
-      evidence: 'head_stability=0.68',
-      suggested_improvement: 'Practice controlled batting drills while maintaining a stable head position.',
-    },
+  const analysisResult = analysis?.analysis || analysis;
+  const weaknesses = analysis?.weaknesses || analysisResult?.weaknesses || [];
+  const recommendations = analysis?.recommendations || [];
+  const strengths = analysisResult?.strengths || [];
+  const breakdown = [
+    { label: 'Overall performance', score: analysisResult?.overall_score, kind: analysisResult?.score_source || 'Estimated from pose' },
+    { label: 'Role adherence', score: analysisResult?.role_adherence?.score, kind: analysisResult?.role_adherence?.source, contributionKey: 'role_adherence' },
+    { label: 'Activity performance', score: analysisResult?.activity_performance?.score, kind: analysisResult?.activity_performance?.source, contributionKey: 'activity_performance' },
+    ...Object.entries(analysisResult?.component_scores || {}).map(([key, score]) => ({ label: key[0].toUpperCase() + key.slice(1), score, kind: analysisResult?.component_sources?.[key] || 'Estimated from pose', contributionKey: key })),
+    { label: 'Score coverage', score: analysisResult?.score_coverage, kind: 'Supported configured weight', suffix: '%' },
   ];
-  const recommendations = analysis?.recommendations || [
-    {
-      title: 'Controlled batting drill',
-      description: 'Practice controlled lower-body movement and repeat the stance-to-shot drill.',
-      reason: 'Generated from detected setback in movement consistency and balance.',
-    },
-  ];
-  const statusTone = /failed|please select|invalid|unavailable|unable/i.test(status) ? 'is-error' : /saved|complete/i.test(status) ? 'is-success' : '';
+  const statusTone = /failed|please select|invalid|unavailable|unable|insufficient/i.test(status) ? 'is-error' : /saved|complete/i.test(status) ? 'is-success' : '';
 
   return (
     <div className="app-shell">
@@ -622,7 +523,7 @@ function App() {
         <div className="header-meta">
           <span className="chip">Player: {player.name}</span>
           <span className="chip">Sport: {activeSport}</span>
-          <span className="chip">Session: {analysis?.session_id ? 'Live' : 'Ready'}</span>
+          <span className="chip">Session: {analysis?.session_id || analysis?.id ? 'Analyzed' : 'Ready'}</span>
         </div>
       </header>
 
@@ -636,7 +537,7 @@ function App() {
 
             <div className="metric-card overall-score-card">
               <div className="metric-label">Overall score</div>
-              <div className="metric-value">{analysis?.analysis?.overall_score ?? 75.4}</div>
+              <div className="metric-value">{analysisResult?.overall_score == null ? (analysisResult ? 'Insufficient' : '—') : Math.round(analysisResult.overall_score)}</div>
             </div>
 
             <div className={`analysis-status ${statusTone}`} role="status" aria-live="polite">
@@ -682,6 +583,7 @@ function App() {
                 <select id="player-sport" value={activeSport} onChange={(e) => {
                   const nextSport = e.target.value;
                   const nextActivity = getValidActivity(nextSport, player.preferred_activity);
+                  setAnalysis(null);
                   setSport(nextSport);
                   setActivity(nextActivity);
                   setPlayer((prev) => ({
@@ -697,7 +599,10 @@ function App() {
               </div>
               <div className="form-group">
                 <label htmlFor="player-role">Role</label>
-                <select id="player-role" value={player.role} onChange={(e) => setPlayer((prev) => ({ ...prev, role: e.target.value }))}>
+                <select id="player-role" value={player.role} onChange={(e) => {
+                  setAnalysis(null);
+                  setPlayer((prev) => ({ ...prev, role: e.target.value }));
+                }}>
                   <option value="">Select Role</option>
                   {(SPORT_ROLES[activeSport] || []).map((role) => <option key={role}>{role}</option>)}
                 </select>
@@ -716,6 +621,7 @@ function App() {
                 <label htmlFor="player-activity">Preferred activity</label>
                 <select id="player-activity" value={activeActivity} onChange={(e) => {
                   const nextActivity = e.target.value;
+                  setAnalysis(null);
                   setActivity(nextActivity);
                   setPlayer((prev) => ({ ...prev, preferred_activity: nextActivity }));
                 }}>
@@ -755,16 +661,15 @@ function App() {
                   <canvas ref={canvasRef} className="camera-canvas" />
                 </div>
 
-                <div className="live-status-block">
+                <div className={`live-status-block${cameraActive ? ' is-live' : ''}${isSessionRunning ? ' is-analyzing' : ''}`}>
                   <span className="badge live-badge">{cameraFacing === 'user' ? 'Front Camera' : 'Back Camera'}</span>
                   <span className="status-subtext">{cameraStatus}</span>
                   <span className="status-subtext">{isSessionRunning ? `Session ${sessionSeconds}s` : cameraReady ? 'Camera ready' : 'Waiting for camera activation'}</span>
                 </div>
 
                 <div className="live-metrics">
-                  <div className="metric-chip"><span>Overall</span><strong>{liveMetrics.overall || 0}</strong></div>
-                  <div className="metric-chip"><span>Technique</span><strong>{liveMetrics.technique || 0}</strong></div>
-                  <div className="metric-chip"><span>Balance</span><strong>{liveMetrics.balance || 0}</strong></div>
+                  <div className="metric-chip"><span>Pose samples</span><strong>{poseFrameCount}</strong></div>
+                  <div className="metric-chip"><span>Analysis</span><strong>{analysisResult?.overall_score == null ? 'Pending' : 'Ready'}</strong></div>
                 </div>
 
                 {cameraError && <div className="live-error">{cameraError}</div>}
@@ -780,7 +685,7 @@ function App() {
                     Pause
                   </button>
                   <button className="btn secondary" onClick={isSessionRunning ? endLiveSession : stopCameraStream}>
-                    {isSessionRunning ? 'Stop' : 'Stop'}
+                    {isSessionRunning ? 'End' : 'Stop'}
                   </button>
                   <button className="btn switch-btn" onClick={switchCamera} disabled={!cameraActive || isSwitchingCamera}>
                     {isSwitchingCamera && <span className="loading-spinner" aria-hidden="true" />}
@@ -789,16 +694,6 @@ function App() {
                 </div>
 
                 <div className="live-insight">{liveInsight}</div>
-                {liveWeaknesses.length > 0 && (
-                  <div className="live-list">
-                    {liveWeaknesses.map((item, idx) => (
-                      <div className="list-item" key={`${item.feature}-${idx}`}>
-                        <div style={{ fontWeight: 700 }}>{item.feature}</div>
-                        <div className="detail-copy" style={{ marginTop: '4px' }}>{item.suggested_improvement}</div>
-                      </div>
-                    ))}
-                  </div>
-                )}
               </div>
             ) : (
               <>
@@ -822,6 +717,82 @@ function App() {
           </div>
         </section>
 
+        <section className="panel performance-breakdown">
+          <div className="card-row breakdown-heading">
+            <div>
+              <p className="section-kicker">Athlete performance analysis</p>
+              <h2>{activeSport} · {player.role || 'Role not selected'} · {activeActivity || 'Activity not selected'}</h2>
+            </div>
+            <span className="badge">{analysisResult?.performance_level || 'Awaiting analysis'}</span>
+          </div>
+          <div className="analysis-score-grid">
+            {breakdown.map((item) => (
+              <div className="analysis-score" key={item.label}>
+                <span>{item.label}</span>
+                <strong>{item.score == null ? (analysisResult ? 'Insufficient data' : '—') : `${Math.round(item.score)}${item.suffix || '/100'}`}</strong>
+                {item.contributionKey && analysisResult?.weighted_contributions?.[item.contributionKey]
+                  ? <small>{item.kind} · {Math.round(analysisResult.weighted_contributions[item.contributionKey].weight * 100)}% weight · {analysisResult.weighted_contributions[item.contributionKey].points.toFixed(1)} pts</small>
+                  : item.kind && <small>{item.kind}</small>}
+              </div>
+            ))}
+            <div className="analysis-score confidence-score">
+              <span>Analysis confidence</span>
+              <strong>{analysisResult?.confidence == null ? '—' : `${analysisResult.confidence}%`}</strong>
+              <small>Pose and sample quality</small>
+            </div>
+          </div>
+          <div className="grid-2 maintenance-grid">
+            <div className="analysis-note">
+              <h3>AI analysis</h3>
+              <p>{analysisResult?.ai_analysis || 'A movement analysis will appear here after a supported video or live-camera session.'}</p>
+            </div>
+            <div className="analysis-note data-quality">
+              <h3>Data quality</h3>
+              <dl>
+                <div><dt>Valid frames</dt><dd>{analysisResult?.data_quality?.valid_frames ?? '—'} / {analysisResult?.data_quality?.sampled_frames ?? '—'}</dd></div>
+                <div><dt>Pose detection</dt><dd>{analysisResult?.data_quality?.pose_detection_rate == null ? '—' : `${analysisResult.data_quality.pose_detection_rate}%`}</dd></div>
+                <div><dt>Landmark visibility</dt><dd>{analysisResult?.data_quality?.mean_landmark_visibility == null ? '—' : `${analysisResult.data_quality.mean_landmark_visibility}%`}</dd></div>
+                <div><dt>Landmark completeness</dt><dd>{analysisResult?.data_quality?.landmark_completeness == null ? '—' : `${analysisResult.data_quality.landmark_completeness}%`}</dd></div>
+                <div><dt>Score coverage</dt><dd>{analysisResult?.score_coverage == null ? '—' : `${analysisResult.score_coverage}%`}</dd></div>
+                <div><dt>Duration</dt><dd>{analysisResult?.data_quality?.duration_seconds == null ? '—' : `${analysisResult.data_quality.duration_seconds}s`}</dd></div>
+              </dl>
+              {analysisResult?.status?.toLowerCase().includes('insufficient') && <p className="quality-warning">Insufficient visual data for reliable analysis.</p>}
+            </div>
+          </div>
+          <div className="grid-2 maintenance-grid">
+            <div className="analysis-note">
+              <h3>Role maintenance · {player.role || 'Not selected'}</h3>
+              <strong>{analysisResult?.role_adherence?.score == null ? (analysisResult ? 'Insufficient data' : '—') : `${analysisResult.role_adherence.score}/100 · ${analysisResult.role_adherence.status}`}</strong>
+              <p>{analysisResult?.role_adherence?.analysis || 'Role alignment requires an analyzed pose sequence.'}</p>
+              {analysisResult?.role_adherence?.confidence != null && <p className="profile-evidence">Confidence {analysisResult.role_adherence.confidence}% · {analysisResult.role_adherence.source}</p>}
+              {!!analysisResult?.role_adherence?.strengths?.length && <p className="profile-evidence"><b>Role strengths:</b> {analysisResult.role_adherence.strengths.join(' ')}</p>}
+              {!!analysisResult?.role_adherence?.weaknesses?.length && <p className="profile-evidence"><b>Role weaknesses:</b> {analysisResult.role_adherence.weaknesses.join(' ')}</p>}
+              {!!analysisResult?.role_adherence?.recommendations?.length && <ul>{analysisResult.role_adherence.recommendations.map((item) => <li key={item}>{item}</li>)}</ul>}
+            </div>
+            <div className="analysis-note">
+              <h3>Activity maintenance · {activeActivity || 'Not selected'}</h3>
+              <strong>{analysisResult?.activity_performance?.score == null ? (analysisResult ? 'Insufficient data' : '—') : `${analysisResult.activity_performance.score}/100 · ${analysisResult.activity_performance.status}`}</strong>
+              <p>{analysisResult?.activity_performance?.analysis || 'Activity movement profile requires an analyzed pose sequence.'}</p>
+              {analysisResult?.activity_performance?.confidence != null && <p className="profile-evidence">Confidence {analysisResult.activity_performance.confidence}% · {analysisResult.activity_performance.source}</p>}
+              {!!analysisResult?.activity_performance?.strengths?.length && <p className="profile-evidence"><b>Activity strengths:</b> {analysisResult.activity_performance.strengths.join(' ')}</p>}
+              {!!analysisResult?.activity_performance?.weaknesses?.length && <p className="profile-evidence"><b>Activity weaknesses:</b> {analysisResult.activity_performance.weaknesses.join(' ')}</p>}
+              {!!analysisResult?.activity_performance?.recommendations?.length && <ul>{analysisResult.activity_performance.recommendations.map((item) => <li key={item}>{item}</li>)}</ul>}
+            </div>
+          </div>
+          <div className="grid-2 maintenance-grid">
+            <div className="analysis-note">
+              <h3>Evidence-backed strengths</h3>
+              {strengths.length ? <ul>{strengths.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul> : <p>No strengths are reported until supported by visible pose measurements.</p>}
+            </div>
+            <div className="analysis-note">
+              <h3>Measured pose metrics</h3>
+              {Object.entries(analysisResult?.metrics || {}).length ? (
+                <dl>{Object.entries(analysisResult.metrics).map(([name, metric]) => <div key={name}><dt>{name.replaceAll('_', ' ')}</dt><dd>{metric.score != null ? `${metric.score}/100` : metric.value != null ? `${metric.value} ${metric.unit || ''}` : 'Insufficient data'} · {metric.source || metric.availability}{metric.confidence != null ? ` · ${metric.confidence}% confidence` : ''}</dd></div>)}</dl>
+              ) : <p>No measurable pose metrics yet.</p>}
+            </div>
+          </div>
+        </section>
+
         <section className="grid-2">
           <div className="panel">
             <h3 style={{ marginTop: 0 }}>Weakness analysis</h3>
@@ -832,6 +803,7 @@ function App() {
                   <div style={{ fontWeight: 700, marginBottom: '6px' }}>{weakness.feature}</div>
                   <div className="detail-copy" style={{ marginBottom: '6px' }}>{weakness.issue}</div>
                   <div className="muted-copy" style={{ fontSize: '0.8rem' }}>{weakness.evidence}</div>
+                  {weakness.impact && <div className="detail-copy" style={{ marginTop: '6px' }}>{weakness.impact}</div>}
                   <div className="detail-copy" style={{ marginTop: '8px' }}>{weakness.suggested_improvement}</div>
                 </div>
               ))}
@@ -856,7 +828,7 @@ function App() {
           <div className="panel">
             <h3 style={{ marginTop: 0 }}>Repeated mistakes</h3>
             <div className="list">
-              {(analysis?.repeated_mistakes || [{ feature: 'Head stability', sessions_affected: 4, trend: 'Repeated pattern detected' }]).map((mistake, idx) => (
+              {(analysis?.repeated_mistakes || []).map((mistake, idx) => (
                 <div className="list-item" key={`${mistake.feature}-${idx}`}>
                   <div style={{ fontWeight: 700 }}>{mistake.feature}</div>
                   <div className="detail-copy" style={{ marginTop: '6px' }}>Affected sessions: {mistake.sessions_affected || 4}</div>
@@ -870,7 +842,7 @@ function App() {
             <h3 style={{ marginTop: 0 }}>Prediction</h3>
             <div className="list-item">
               <div style={{ fontWeight: 700 }}>Current performance</div>
-              <div className="detail-copy" style={{ marginTop: '6px' }}>{analysis?.prediction?.current_performance ?? 75.4}</div>
+              <div className="detail-copy" style={{ marginTop: '6px' }}>{analysis?.prediction?.current_performance ?? 'No analyzed session yet'}</div>
             </div>
             <div className="list-item" style={{ marginTop: '12px' }}>
               <div style={{ fontWeight: 700 }}>Predicted future performance</div>
@@ -882,11 +854,11 @@ function App() {
         <section className="panel">
           <h3 style={{ marginTop: 0 }}>Session history</h3>
           <div className="list">
-            {(sessions.length ? sessions : [{ id: 'sample', overall_score: 76.2, activity: 'Batting', sport: 'Cricket' }]).map((session, index) => (
+            {sessions.map((session, index) => (
               <div className="list-item" key={session.id || index}>
                 <div className="card-row">
                   <strong>{session.activity || 'Batting'}</strong>
-                  <span className="badge">{session.overall_score ?? 76.2}</span>
+                  <span className="badge">{session.overall_score ?? 'Insufficient data'}</span>
                 </div>
                 <div className="muted-copy" style={{ marginTop: '8px' }}>{session.sport || 'Cricket'}</div>
               </div>

@@ -1,16 +1,10 @@
-import os
 import uuid
-from pathlib import Path
-
-import cv2
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from database.database import Session as SessionRecord, Player, get_db
-from services.feature_extractor import extract_features
-from services.performance_analyzer import PerformanceAnalyzer
-from services.weakness_detector import WeaknessDetector
+from services.sport_analysis_engine import SportAnalysisEngine
 from services.mistake_detector import MistakeDetector
 from services.prediction_engine import PredictionEngine
 from services.coaching_engine import CoachingEngine
@@ -43,36 +37,38 @@ def analyze_video(payload: AnalysisRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Unable to extract frames from video")
 
     estimator = PoseEstimator()
-    pose_metrics = []
-    for frame in frames:
-        results, landmarks = estimator.estimate_pose(frame)
-        if landmarks:
-            metrics = extract_features(landmarks)
-            if metrics.get("status") == "Pose data available":
-                pose_metrics.append(metrics["metrics"])
+    pose_frames = []
+    try:
+        for frame in frames:
+            _, landmarks = estimator.estimate_pose(frame)
+            if landmarks:
+                pose_frames.append(landmarks)
+    finally:
+        estimator.pose.close()
 
-    if not pose_metrics:
-        raise HTTPException(status_code=422, detail="Pose estimation failed. No valid landmarks detected.")
+    selected_role = payload.role or player.role
+    selected_sport = payload.sport or player.sport
+    selected_activity = payload.activity or player.preferred_activity
+    duration_seconds = processor.total_frames / processor.fps if processor.fps > 0 else None
+    analysis = SportAnalysisEngine().analyze(
+        selected_sport,
+        selected_role,
+        selected_activity,
+        pose_frames,
+        sampled_frames=len(frames),
+        duration_seconds=duration_seconds,
+    )
+    if analysis["overall_score"] is None:
+        raise HTTPException(status_code=422, detail=analysis["status"])
 
-    avg_metrics = {}
-    for key in set().union(*(d.keys() for d in pose_metrics)):
-        values = [d.get(key) for d in pose_metrics if d.get(key) is not None]
-        if values:
-            avg_metrics[key] = sum(values) / len(values)
-
-    avg_metrics.setdefault("balance_score", 0.7)
-    avg_metrics.setdefault("movement_score", 0.72)
-    avg_metrics.setdefault("movement_consistency", 0.68)
-    avg_metrics.setdefault("stability_score", 0.74)
-
-    analyzer = PerformanceAnalyzer()
-    analysis = analyzer.analyze(avg_metrics)
-
-    weakness_detector = WeaknessDetector()
-    weaknesses = weakness_detector.detect(avg_metrics)
+    weaknesses = analysis["weaknesses"]
 
     prior_sessions = []
-    history = db.query(SessionRecord).filter(SessionRecord.player_id == payload.player_id).all()
+    history = db.query(SessionRecord).filter(
+        SessionRecord.player_id == payload.player_id,
+        SessionRecord.sport == selected_sport,
+        SessionRecord.activity == selected_activity,
+    ).all()
     for session in history:
         prior_sessions.append({
             "weaknesses": session.weaknesses or [],
@@ -87,25 +83,32 @@ def analyze_video(payload: AnalysisRequest, db: Session = Depends(get_db)):
     prediction = prediction_engine.predict(history_scores, analysis["overall_score"])
 
     coaching_engine = CoachingEngine()
-    recommendations = coaching_engine.generate_recommendations(weaknesses, repeated_mistakes, prediction)
+    recommendations = coaching_engine.generate_recommendations(
+        weaknesses,
+        repeated_mistakes,
+        prediction,
+        sport=selected_sport,
+        role=selected_role,
+        activity=selected_activity,
+    )
 
     session_id = str(uuid.uuid4())
     record = SessionRecord(
         id=session_id,
         player_id=payload.player_id,
-        sport=payload.sport,
-        activity=payload.activity,
+        sport=selected_sport,
+        activity=selected_activity,
         video_reference=payload.video_path,
         overall_score=float(analysis["overall_score"]),
-        technique_score=float(analysis["component_scores"].get("technique", 0.0)),
-        balance_score=float(analysis["component_scores"].get("balance", 0.0)),
-        movement_score=float(analysis["component_scores"].get("movement", 0.0)),
-        consistency_score=float(analysis["component_scores"].get("consistency", 0.0)),
-        stability_score=float(analysis["component_scores"].get("stability", 0.0)),
+        technique_score=float(analysis.get("technique_score") or 0.0),
+        balance_score=float(analysis.get("balance_score") or 0.0),
+        movement_score=float(analysis.get("movement_score") or 0.0),
+        consistency_score=float(analysis.get("consistency_score") or 0.0),
+        stability_score=float(analysis.get("stability_score") or 0.0),
         weaknesses=weaknesses,
         repeated_mistakes=repeated_mistakes,
         recommendations=recommendations,
-        prediction_data=prediction,
+        prediction_data={**prediction, "role": selected_role, "sport_analysis": analysis, "source": "VIDEO"},
     )
     db.add(record)
     db.commit()
@@ -114,9 +117,9 @@ def analyze_video(payload: AnalysisRequest, db: Session = Depends(get_db)):
     return {
         "session_id": session_id,
         "player": player.name,
-        "sport": payload.sport,
-        "role": payload.role or player.role,
-        "activity": payload.activity,
+        "sport": selected_sport,
+        "role": selected_role,
+        "activity": selected_activity,
         "processing_pipeline": [
             "Uploading",
             "Processing",
@@ -128,6 +131,7 @@ def analyze_video(payload: AnalysisRequest, db: Session = Depends(get_db)):
             "Coaching",
         ],
         "analysis": analysis,
+        **analysis,
         "weaknesses": weaknesses,
         "repeated_mistakes": repeated_mistakes,
         "prediction": prediction,
